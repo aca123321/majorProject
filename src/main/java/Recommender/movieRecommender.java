@@ -35,26 +35,34 @@ public class movieRecommender {
 
 //        Dataset<Row> newUserList = spark.read().option("inferSchema",true).option("header",true).csv("src/main/resources/ml-100k/newUserList.csv");
 
-        int moviesConsidered = 100;
+        int moviesConsidered = 100; //should be that much greater than (pearsonMoviesConsidered+30), based on how many Matrix Factorisation recs you want
+        // ie: if moviesConsidered = 100, pearsonMoviesConsidered = 20, then (100 - (20+30)) = 50 movies will be recommended by Matrix Factorisation algorithm
+        int pearsonMoviesConsidered = 20;
         double penaltyMultiplier = 1.5; // if there's a negative genre rating, what multiplier to penalise it with
         double bonusMultiplier = 1.0; // if there's a positive genre rating, what multiplier to reward it with
         double closestMultiple = 0.001;
+        int numUsers = 611;
+        boolean showRecommendations = false;
+
+        PearsonCoefficient.getUserMeans(spark, numUsers);
 
         List<Double> rmseList = new ArrayList<>();
         List<Double> mapeList = new ArrayList<>();
 
-        for(int i=600;i<=611;i++)
+        for(int i=400;i<=500;i++)
         {
             int userId = i;
-            int numUsers = 611;
 
-            Dataset<Row> newUserList = spark.sql("select * from ratings where userId=" + userId);
+//            Dataset<Row> newUserList = spark.sql("select * from ratings where userId=" + userId);
             List<movieScorePair> scoring = getScores(spark, ratingsData, movieData, userId,
-                    numUsers, moviesConsidered, bonusMultiplier, penaltyMultiplier, closestMultiple);
+                    numUsers, moviesConsidered, pearsonMoviesConsidered, bonusMultiplier, penaltyMultiplier, closestMultiple);
 
             double N = currentUserRatings.size();
             double totalSquaredError = 0,totalPercentError = 0;
-//            System.out.println("\nUserId: " + userId + "\nRecommendations:");
+            if(showRecommendations)
+            {
+                System.out.println("\nUserId: " + userId + "\nRecommendations:");
+            }
             for(movieScorePair p: scoring)
             {
                 if(currentUserRatings.containsKey(p.movieId))
@@ -65,6 +73,10 @@ public class movieRecommender {
                     totalSquaredError += (diff*diff);
                     totalPercentError += ((Math.abs(diff))/actualScore)*100;
 //                    System.out.println(p.movie + ": assigned=" + p.score + ", original=" + currentUserRatings.get(p.movieId));
+                }
+                else if(showRecommendations)
+                {
+                    System.out.println(p.movie + ": " + p.score);
                 }
             }
 
@@ -89,15 +101,15 @@ public class movieRecommender {
         System.out.println("Median MAPE: " + medianMAPE);
     }
 
-    public static List<movieScorePair> getScores(SparkSession spark, Dataset<Row> ratingsData,
-                                                 Dataset<Row> movieData, int userId, int numUsers,
-                                                 int moviesConsidered,double bonusMultiplier, double penaltyMultiplier, double closestMultiple) throws IOException {
+    public static List<movieScorePair> getScores(SparkSession spark, Dataset<Row> ratingsData, Dataset<Row> movieData,
+                                                 int userId, int numUsers, int moviesConsidered, int pearsonMoviesConsidered,
+                                                 double bonusMultiplier, double penaltyMultiplier, double closestMultiple) throws IOException {
         currentUserId = userId;
 
         Dataset<Row> userMovieRatings = spark.sql("select * from ratings where userId=" + userId);
 
         // userRecs contains matrix factorisation recs
-        Dataset<Row> userRecs = getRecs(ratingsData, userMovieRatings, moviesConsidered);
+        Dataset<Row> userRecs = getRecs(ratingsData, userMovieRatings, moviesConsidered-pearsonMoviesConsidered-30);
 
         userMovieRatings = userMovieRatings.join(movieData,"movieId");
         //user movie ratings contains info about all movies rated by the user
@@ -105,12 +117,11 @@ public class movieRecommender {
 //        System.out.println("userMovieRatings:");
 //        userMovieRatings.show(false);
 
-        HashMap<Integer, Double> userRatings = new HashMap<>();
 
         // Getting "moviesConsidered" number of recommendations (at max.) in recs list
         List<Row> userRecsList = userRecs.takeAsList(moviesConsidered);
         // recs contains all the movie ids from the ALS recs
-        List<Integer> recs = new ArrayList<>();
+        ArrayList<Integer> recs = new ArrayList<>();
         for(Row r: userRecsList)
         {
             userId = r.getAs(0);
@@ -122,18 +133,13 @@ public class movieRecommender {
             }
         }
 
-        // TODO -Add Pearson recommended movie IDs to the recs list
-//        ArrayList<Long> pearsonRecs = PearsonCoefficient.getPearsonRecs(50, userId, 50, numUsers);
-//        for(long movieId: pearsonRecs)
-//        {
-//            System.out.println("adding movieId " + movieId);
-//            recs.add((int)movieId);
-//        }
-
+        HashMap<Integer, Double> userRatings = new HashMap<>();
         // Creating genre rating
         Map<String, Pair<Double, Integer>> genreRating = new HashMap<>();
-        double avgUserRating = PearsonCoefficient.getUserMeans(spark, numUsers)[userId];
-        List<Row> userMoviesList = userMovieRatings.takeAsList(50);
+        double avgUserRating = PearsonCoefficient.userMeans[userId];
+        List<Row> userMoviesList = userMovieRatings.takeAsList(30);
+
+        // TODO recs could have repeated movieIds if some of the recommended movies and the user rated movies overlap
         for(Row r: userMoviesList)
         {
             int movieId = ((int) r.get(0));
@@ -163,6 +169,15 @@ public class movieRecommender {
         currentAvgUserRating = avgUserRating;
         currentUserRatings = userRatings;
 
+
+        // TODO -Add Pearson recommended movie IDs to the recs list
+        ArrayList<Integer> pearsonRecs = PearsonCoefficient.getPearsonRecs(spark, ratingsData,pearsonMoviesConsidered, userId, 10, numUsers);
+        for(int movieId: pearsonRecs)
+        {
+//            System.out.println("adding movieId " + movieId);
+            recs.add(movieId);
+        }
+
 //        System.out.println("Genre Rating:");
 //        for (String genre : genreRating.keySet()) {
 //            Pair<Double, Integer> p = genreRating.get(genre);
@@ -175,7 +190,7 @@ public class movieRecommender {
         // collecting the recommended movies info from movieData
         Dataset<Row> recMovies, temp;
         recMovies = spark.sql("select * from movies where movieId=" + recs.get(0));
-        for(int i=0;i<recs.size();i++)
+        for(int i=1;i<recs.size();i++)
         {
             int rec = recs.get(i);
             temp = spark.sql("select * from movies where movieId=" + rec);
@@ -183,8 +198,7 @@ public class movieRecommender {
         }
 
         //scoring the movies from the collaborative filtering result(recs) using genreRating
-        List<Row> recMoviesList = recMovies.takeAsList(moviesConsidered+50);
-        Map<String, Double> scores = new HashMap<>();
+        List<Row> recMoviesList = recMovies.takeAsList(moviesConsidered);
         List<movieScorePair> scoring = new ArrayList<>();
         for(Row row: recMoviesList)
         {
@@ -215,8 +229,6 @@ public class movieRecommender {
             movieScore /= ((genres.length) * 100);
             movieScore *= avgUserRating;
             movieScore = roundTo(movieScore, closestMultiple);
-
-            scores.put(movie,movieScore);
             scoring.add(new movieScorePair(movieScore, movie, movieId));
         }
 

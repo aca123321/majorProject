@@ -21,6 +21,8 @@ import java.util.*;
 public class PearsonCoefficient {
 
     public static Double[] userMeans;
+    //TODO store coeffs
+    public static Double[][] PearsonCoeffs = new Double[611][611];
 
     public static void main(String[] args) throws IOException {
         Logger.getLogger("org.apache").setLevel(Level.WARN);
@@ -33,18 +35,79 @@ public class PearsonCoefficient {
 
         createUserMeanCSV(dataset, spark);
 
-        int numUsers = 612;
+        int numUsers = 611;
         createPearsonCoeffsCSV(dataset, spark, numUsers);
 
-        int topKForUser = 612;
-        getTopK(10, topKForUser);
+        int userId = 611;
+        getTopNeighbours(userId);
     }
 
-    public static ArrayList<Long> getPearsonRecs(int numRecs, int userId, int kNeighbours, int numUsers) throws IOException {
-        List<Pair<Integer, Double>> topNeighbours = getTopK(kNeighbours, userId);
-        ArrayList<Long> recMovieIds = new ArrayList<>();
+    public static ArrayList<Integer> getPearsonRecs(SparkSession spark, Dataset<Row> ratings,int numRecs, int userId, int kNeighbours, int numUsers) throws IOException {
+        List<Pair<Integer, Double>> topNeighbours = getTopNeighbours(userId);
+        ArrayList<Integer> recMovieIds = new ArrayList<>();
+        ArrayList<Pair<Integer, Double>> recList = new ArrayList<>();
 
+        HashMap<Integer, Pair<Double,Integer>> recMap = new HashMap<>();
+        ratings.createOrReplaceTempView("ratings");
+        for(int i=0;i<Math.min(kNeighbours,topNeighbours.size());i++)
+        {
+            int neighbourId = topNeighbours.get(i).getKey();
+            double avgNeighbourRating = userMeans[neighbourId];
+            Dataset<Row> neighbourRatings = spark.sql("select * from ratings where userId=" + neighbourId);
+            List<Row> neighbourRatingsList = neighbourRatings.takeAsList((int) neighbourRatings.count());
 
+            for(Row row: neighbourRatingsList)
+            {
+                int movieId = (int) row.get(1);
+                double rating = (double) row.get(2);
+                rating = ((rating-avgNeighbourRating)/avgNeighbourRating)*100;
+                if(recMap.containsKey(movieId))
+                {
+                    Pair<Double,Integer> p = recMap.get(movieId);
+                    double prevRating = p.getKey();
+                    prevRating += rating;
+                    int numOccurrences = p.getValue();
+                    numOccurrences++;
+                    recMap.put(movieId, new Pair<Double, Integer>(prevRating,numOccurrences));
+                }
+                else
+                {
+                    recMap.put(movieId, new Pair<Double, Integer>(rating,1));
+                }
+            }
+        }
+
+        for(Map.Entry e : recMap.entrySet())
+        {
+            int movieId = (int) e.getKey();
+            Pair<Double, Integer> p = (Pair<Double, Integer>) e.getValue();
+            double rating = p.getKey();
+            int numOccurrences = p.getValue();
+            rating = (rating/numOccurrences);
+            if(rating > 0)
+            {
+                recList.add(new Pair<Integer, Double>(movieId,rating));
+            }
+        }
+
+        for(int a=0;a<recList.size();a++)
+        {
+            for(int b=a+1;b<recList.size();b++)
+            {
+                Pair<Integer, Double> p1 = recList.get(a);
+                Pair<Integer, Double> p2 = recList.get(b);
+                if(p2.getValue() > p1.getValue())
+                {
+                    recList.set(a,p2);
+                    recList.set(b,p1);
+                }
+            }
+        }
+
+        for(int i=0;i<Math.min(numRecs,recList.size());i++)
+        {
+            recMovieIds.add(recList.get(i).getKey());
+        }
 
         return recMovieIds;
     }
@@ -62,11 +125,11 @@ public class PearsonCoefficient {
 
         createPearsonCoeffsCSV(dataset, spark, numUsers);
 
-        ArrayList<Pair<Integer, Double>> topK = getTopK(k, user);
+        ArrayList<Pair<Integer, Double>> topK = getTopNeighbours(user);
         return topK;
     }
 
-    public static ArrayList<Pair<Integer, Double>> getTopK(int k, int user) throws FileNotFoundException {
+    public static ArrayList<Pair<Integer, Double>> getTopNeighbours(int user) throws FileNotFoundException {
         File f = new File("src/main/resources/ml-100k/pearsonCoeffs.csv");
         Scanner reader = new Scanner(f);
         TreeMap<Double, Integer> coeffMap = new TreeMap<>();
@@ -96,7 +159,10 @@ public class PearsonCoefficient {
             double coeff = (Double)c;
             int userId = coeffMap.get(coeff);
 //            System.out.println(userId + ": " + coeff);
-            topNeighbours.add(new Pair<Integer, Double>(userId, coeff));
+            if(coeff > 0 && userId != user)
+            {
+                topNeighbours.add(new Pair<Integer, Double>(userId, coeff));
+            }
         }
 
         return topNeighbours;
